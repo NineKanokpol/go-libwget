@@ -136,43 +136,44 @@ func doConnect(cfg Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	// ✅ สำคัญ: endpoint = "s3gw.inet.co.th:8082" (ไม่มี http://)
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+
 	opts := &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
-		Secure: cfg.UseSSL,
+		Creds:        credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Secure:       cfg.UseSSL,
+		BucketLookup: minio.BucketLookupPath,
 	}
-	if strings.TrimSpace(cfg.Region) != "" {
-		opts.Region = cfg.Region
+	if region := strings.TrimSpace(cfg.Region); region != "" {
+		opts.Region = region
 	}
 
-	client, err := minio.New(cfg.Endpoint, opts)
+	client, err := minio.New(endpoint, opts)
 	if err != nil {
 		return fmt.Errorf("init client: %w", err)
 	}
 
-	// ทดสอบสิทธิ์เบื้องต้น: ลิสต์ bucket (ถ้าอนุญาต) หรือ head บัคเก็ตที่ระบุ
-	if strings.TrimSpace(cfg.Bucket) != "" {
-		// เช็คว่าบัคเก็ตมีจริงไหม / ต่อได้ไหม
-		exists, err := client.BucketExists(ctx, cfg.Bucket)
+	// ถ้ากรอก bucket มาก็เช็คเฉพาะ bucket ก่อน (แน่นอนกว่า)
+	if b := strings.TrimSpace(cfg.Bucket); b != "" {
+		exists, err := client.BucketExists(ctx, b)
 		if err != nil {
 			return fmt.Errorf("check bucket: %w", err)
 		}
 		if !exists {
-			fmt.Println("⚠ bucket does not exist or not accessible:", cfg.Bucket)
+			fmt.Println("⚠ bucket not accessible:", b)
 		} else {
-			fmt.Println("✔ bucket accessible:", cfg.Bucket)
+			fmt.Println("✔ bucket accessible:", b)
 		}
-	} else {
-		// ลอง list buckets (ถ้า policy อนุญาต)
-		bs, err := client.ListBuckets(ctx)
-		if err != nil {
-			// ไม่ล้มทันที—รายงานเตือน (บางกรณีห้าม ListBuckets แต่ยังใช้งานได้)
-			fmt.Println("⚠ cannot list buckets (permission?):", err)
-		} else {
-			fmt.Println("✔ buckets:", len(bs))
-			for _, b := range bs {
-				fmt.Println("  -", b.Name)
-			}
-		}
+	}
+
+	// ✅ ทดสอบ ListBuckets (ต้องมีสิทธิ์ s3:ListAllMyBuckets)
+	bs, err := client.ListBuckets(ctx)
+	if err != nil {
+		return fmt.Errorf("list buckets failed: %w", err)
+	}
+	fmt.Println("✔ buckets:", len(bs))
+	for _, b := range bs {
+		fmt.Println("  -", b.Name)
 	}
 
 	return nil
