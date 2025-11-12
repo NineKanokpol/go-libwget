@@ -16,5 +16,5 @@ func main() {
 		return
 	}
 
-	fmt.Println("Hello world this is My LibTTTT")
+	fmt.Println("Hello world this is My LibVersion0.1.1")
 }
