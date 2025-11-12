@@ -1,48 +1,265 @@
-// /Users/nineimacm2/Documents/test-go-wget/main.go
 package main
 
 import (
+	"bufio"
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"golang.org/x/term"
 )
 
 var version = "dev"
 
+type Config struct {
+	Endpoint  string `json:"endpoint"` // e.g. s3.amazonaws.com or play.min.io:9000
+	AccessKey string `json:"accessKey"`
+	SecretKey string `json:"secretKey"`
+	Region    string `json:"region"` // e.g. ap-southeast-1 (เว้นว่างได้ถ้า MinIO ไม่บังคับ)
+	UseSSL    bool   `json:"useSSL"` // true=https
+	Bucket    string `json:"bucket"` // ออปชัน: บัคเก็ตที่อยากทดสอบเข้าถึง
+}
+
 func main() {
-	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Parse()
+	// subcommand: connect (มี --use-config / --save)
+	connectCmd := flag.NewFlagSet("connect", flag.ExitOnError)
+	useConfig := connectCmd.Bool("use-config", false, "use saved config at ~/.mycli/config.json")
+	saveConfig := connectCmd.Bool("save", false, "save answers to ~/.mycli/config.json after successful connect")
 
 	// mycli -version
+	showVersion := flag.Bool("version", false, "print version and exit")
+
+	if len(os.Args) == 1 {
+		usage()
+		return
+	}
+
+	switch os.Args[1] {
+	case "-version", "--version":
+		*showVersion = true
+	}
+
+	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
 		return
 	}
 
-	// ถ้าไม่มีคำสั่งตามหลัง -> โชว์ข้อความเดิม
-	args := flag.Args()
-	if len(args) == 0 {
-		fmt.Println("Hello world this is My Lib")
-		return
-	}
-
-	// mycli pwd         -> รัน /usr/bin/pwd (ตาม PATH)
-	// mycli ls -la      -> รัน ls -la
-	cmdName := args[0]
-	cmdArgs := args[1:]
-
-	cmd := exec.Command(cmdName, cmdArgs...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		// ส่งต่อ exit code ที่แท้จริง (ถ้ามี) เพื่อให้สคริปต์เช็คสถานะได้
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+	switch os.Args[1] {
+	case "connect":
+		connectCmd.Parse(os.Args[2:])
+		if *useConfig {
+			cfg, err := loadConfig()
+			if err != nil {
+				fmt.Println("failed to load config:", err)
+				os.Exit(1)
+			}
+			if err := doConnect(cfg); err != nil {
+				fmt.Println("connect error:", err)
+				os.Exit(1)
+			}
+			fmt.Println("✅ Connected successfully (using saved config)")
+			return
 		}
-		fmt.Fprintln(os.Stderr, "run error:", err)
-		os.Exit(1)
+
+		// wizard: ถามค่าตามลำดับเหมือน login
+		cfg, err := wizard()
+		if err != nil {
+			fmt.Println("input error:", err)
+			os.Exit(1)
+		}
+
+		if err := doConnect(cfg); err != nil {
+			fmt.Println("connect error:", err)
+			os.Exit(1)
+		}
+		fmt.Println("✅ Connected successfully")
+
+		if *saveConfig {
+			if err := saveConfigFile(cfg); err != nil {
+				fmt.Println("warn: cannot save config:", err)
+			} else {
+				fmt.Println("💾 Saved config at", configPath())
+			}
+		}
+	default:
+		usage()
 	}
+}
+
+func usage() {
+	fmt.Println(`mycli - simple S3/MinIO connect wizard
+
+Usage:
+  mycli -version
+  mycli connect                # เปิดตัวช่วยถามค่าทีละข้อ แล้วพยายามเชื่อมต่อ
+  mycli connect --save         # ถามค่า → ต่อสำเร็จ → บันทึก ~/.mycli/config.json
+  mycli connect --use-config   # ใช้ค่าจาก ~/.mycli/config.json แล้วเชื่อมต่อทันที
+
+Tips:
+  - Endpoint: เช่น "s3.amazonaws.com" หรือ "minio.yourdomain.com:9000"
+  - Region: สำหรับ AWS S3 ต้องกรอก เช่น "ap-southeast-1"; MinIO ส่วนมากเว้นว่างได้
+  - UseSSL: พิมพ์ y/n (y = https)
+`)
+}
+
+func wizard() (Config, error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Println("=== S3/MinIO Connect Wizard ===")
+	endpoint := mustReadLine(reader, "Endpoint (e.g. s3.amazonaws.com or minio.example.com:9000): ")
+	accessKey := mustReadLine(reader, "Access Key: ")
+	secretKey := mustReadPassword("Secret Key (input hidden): ")
+	region := readLine(reader, "Region (leave empty if not required): ")
+	useSSL := mustReadYesNo(reader, "Use SSL? [y/N]: ")
+	bucket := readLine(reader, "Bucket to test access (optional): ")
+
+	cfg := Config{
+		Endpoint:  endpoint,
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+		Region:    region,
+		UseSSL:    useSSL,
+		Bucket:    bucket,
+	}
+	return cfg, nil
+}
+
+func doConnect(cfg Config) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	opts := &minio.Options{
+		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Secure: cfg.UseSSL,
+	}
+	if strings.TrimSpace(cfg.Region) != "" {
+		opts.Region = cfg.Region
+	}
+
+	client, err := minio.New(cfg.Endpoint, opts)
+	if err != nil {
+		return fmt.Errorf("init client: %w", err)
+	}
+
+	// ทดสอบสิทธิ์เบื้องต้น: ลิสต์ bucket (ถ้าอนุญาต) หรือ head บัคเก็ตที่ระบุ
+	if strings.TrimSpace(cfg.Bucket) != "" {
+		// เช็คว่าบัคเก็ตมีจริงไหม / ต่อได้ไหม
+		exists, err := client.BucketExists(ctx, cfg.Bucket)
+		if err != nil {
+			return fmt.Errorf("check bucket: %w", err)
+		}
+		if !exists {
+			fmt.Println("⚠ bucket does not exist or not accessible:", cfg.Bucket)
+		} else {
+			fmt.Println("✔ bucket accessible:", cfg.Bucket)
+		}
+	} else {
+		// ลอง list buckets (ถ้า policy อนุญาต)
+		bs, err := client.ListBuckets(ctx)
+		if err != nil {
+			// ไม่ล้มทันที—รายงานเตือน (บางกรณีห้าม ListBuckets แต่ยังใช้งานได้)
+			fmt.Println("⚠ cannot list buckets (permission?):", err)
+		} else {
+			fmt.Println("✔ buckets:", len(bs))
+			for _, b := range bs {
+				fmt.Println("  -", b.Name)
+			}
+		}
+	}
+
+	return nil
+}
+
+func mustReadLine(r *bufio.Reader, prompt string) string {
+	for {
+		s := readLine(r, prompt)
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+		fmt.Println("  value is required, please try again.")
+	}
+}
+
+func readLine(r *bufio.Reader, prompt string) string {
+	fmt.Print(prompt)
+	text, _ := r.ReadString('\n')
+	return strings.TrimSpace(text)
+}
+
+func mustReadYesNo(r *bufio.Reader, prompt string) bool {
+	fmt.Print(prompt)
+	for {
+		s, _ := r.ReadString('\n')
+		s = strings.TrimSpace(strings.ToLower(s))
+		if s == "" || s == "n" || s == "no" {
+			return false
+		}
+		if s == "y" || s == "yes" {
+			return true
+		}
+		fmt.Print("  please answer y or n: ")
+	}
+}
+
+func mustReadPassword(prompt string) string {
+	fmt.Print(prompt)
+	// ใช้ x/term เพื่อซ่อนการพิมพ์ secret
+	pwBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println() // ขึ้นบรรทัดใหม่หลังพิมพ์รหัสผ่าน
+	if err != nil {
+		fmt.Println("  (warn) cannot hide input, fall back to visible")
+		reader := bufio.NewReader(os.Stdin)
+		return mustReadLine(reader, "")
+	}
+	pw := strings.TrimSpace(string(pwBytes))
+	for pw == "" {
+		reader := bufio.NewReader(os.Stdin)
+		pw = mustReadLine(reader, "  Secret cannot be empty. Enter again: ")
+	}
+	return pw
+}
+
+func configDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".mycli")
+}
+
+func configPath() string {
+	return filepath.Join(configDir(), "config.json")
+}
+
+func saveConfigFile(cfg Config) error {
+	dir := configDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(configPath())
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(cfg)
+}
+
+func loadConfig() (Config, error) {
+	var cfg Config
+	f, err := os.Open(configPath())
+	if err != nil {
+		return cfg, err
+	}
+	defer f.Close()
+	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
