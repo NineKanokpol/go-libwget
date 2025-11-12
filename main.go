@@ -16,5 +16,5 @@ func main() {
 		return
 	}
 
-	fmt.Println("Hello world this is My Lib")
+	fmt.Println("Hello world this is My LibTTTT")
 }
